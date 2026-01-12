@@ -11,6 +11,7 @@
 #include <sys/resource.h>
 #include <sys/sysinfo.h>
 #include <errno.h>
+#include <signal.h>
 
 // Column indices for tree view
 enum {
@@ -131,6 +132,16 @@ static const char *css_style =
     "    background: rgba(30, 30, 30, 0.9);"
     "    padding: 6px;"
     "    border-radius: 4px;"
+    "}"
+    ""
+    "#kill-button {"
+    "    background: linear-gradient(135deg, #8b2020, #a52a2a);"
+    "    border: 1px solid rgba(255, 80, 80, 0.5);"
+    "}"
+    "#kill-button:hover {"
+    "    background: linear-gradient(135deg, #cc3333, #e04040);"
+    "    border-color: #ff5050;"
+    "    box-shadow: 0 0 12px rgba(255, 80, 80, 0.6);"
     "}";
 
 // Global CPU time tracking (updated once per cycle, not per process)
@@ -715,6 +726,132 @@ static void apply_to_family_recursive(pid_t pid, const char *target_exe, const R
     closedir(proc_dir);
 }
 
+// Check if a process is a "system boundary" - something we should never kill
+// when trying to kill an application (init, systemd, shells, session managers, etc.)
+static bool is_system_boundary(pid_t pid) {
+    if (pid <= 1) return true;  // init/systemd
+
+    char comm[256];
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return true;  // Can't read = assume system
+
+    if (!fgets(comm, sizeof(comm), f)) {
+        fclose(f);
+        return true;
+    }
+    fclose(f);
+    comm[strcspn(comm, "\n")] = '\0';
+
+    // List of system boundary processes - these should never be killed as "parents"
+    static const char *system_procs[] = {
+        "systemd", "init", "bash", "zsh", "sh", "fish", "ksh", "tcsh", "csh",
+        "login", "sshd", "gdm", "sddm", "lightdm", "xdm",
+        "gnome-session", "plasma", "xfce4-session", "mate-session",
+        "dbus-daemon", "dbus-broker", "polkitd", "upowerd",
+        "Xorg", "Xwayland", "kwin", "mutter", "weston", "sway", "hyprland",
+        "tmux", "screen", "sudo", "su", "pkexec", "doas",
+        NULL
+    };
+
+    for (int i = 0; system_procs[i] != NULL; i++) {
+        if (strcmp(comm, system_procs[i]) == 0) return true;
+    }
+    return false;
+}
+
+// Find the application root - go UP the tree until we hit a system boundary
+static pid_t find_application_root(pid_t pid) {
+    pid_t current = pid;
+    pid_t root = pid;
+
+    while (current > 1) {
+        pid_t parent = get_parent_pid(current);
+        if (parent <= 1) break;
+        if (is_system_boundary(parent)) break;
+
+        root = parent;
+        current = parent;
+    }
+    return root;
+}
+
+// Collect all descendant PIDs recursively (children, grandchildren, etc.)
+// Does NOT include ancestors - only goes DOWN the process tree
+static void collect_descendants(pid_t pid, pid_t *pids, int *count, int max_pids) {
+    if (*count >= max_pids) return;
+
+    DIR *proc_dir = opendir("/proc");
+    if (!proc_dir) return;
+
+    struct dirent *entry;
+    while ((entry = readdir(proc_dir)) != NULL) {
+        if (*count >= max_pids) break;
+        if (entry->d_type != DT_DIR) continue;
+
+        char *endptr;
+        long child_pid = strtol(entry->d_name, &endptr, 10);
+        if (*endptr != '\0' || child_pid <= 0) continue;
+
+        // Check if this process's parent is the one we're looking for
+        if (get_parent_pid((pid_t)child_pid) == pid) {
+            pids[(*count)++] = (pid_t)child_pid;
+            // Recurse to find this child's children
+            collect_descendants((pid_t)child_pid, pids, count, max_pids);
+        }
+    }
+    closedir(proc_dir);
+}
+
+// Kill a process and all its descendants
+// Returns number of processes killed, -1 on error
+static int kill_process_tree(pid_t root_pid) {
+    #define MAX_KILL_PIDS 1024
+    pid_t pids[MAX_KILL_PIDS];
+    int count = 0;
+    int killed = 0;
+
+    // First, collect all descendants
+    collect_descendants(root_pid, pids, &count, MAX_KILL_PIDS);
+
+    // Kill children first (bottom-up) to avoid orphaning
+    // Reverse order since collect_descendants adds parents before children
+    for (int i = count - 1; i >= 0; i--) {
+        if (kill(pids[i], SIGTERM) == 0) {
+            killed++;
+        }
+    }
+
+    // Finally kill the root process
+    if (kill(root_pid, SIGTERM) == 0) {
+        killed++;
+    } else if (errno == ESRCH) {
+        // Process already gone, that's fine
+    } else if (errno == EPERM) {
+        // Try SIGKILL as fallback (might need root)
+        if (kill(root_pid, SIGKILL) == 0) {
+            killed++;
+        }
+    }
+
+    // Give processes a moment to terminate, then SIGKILL any survivors
+    usleep(100000); // 100ms
+
+    for (int i = 0; i < count; i++) {
+        // Check if still alive and force kill
+        if (kill(pids[i], 0) == 0) {
+            kill(pids[i], SIGKILL);
+        }
+    }
+    if (kill(root_pid, 0) == 0) {
+        kill(root_pid, SIGKILL);
+    }
+
+    return killed > 0 ? killed : -1;
+    #undef MAX_KILL_PIDS
+}
+
 // Apply affinity and priority to selected process
 void on_apply_clicked(GtkButton *button, gpointer data) {
     (void)button;
@@ -816,6 +953,67 @@ void on_apply_clicked(GtkButton *button, gpointer data) {
                 gtk_label_set_text(GTK_LABEL(app->status_label), status);
             }
         }
+    }
+}
+
+// Kill selected process and its entire application tree
+// Finds the application root (going UP past child workers) then kills DOWN
+void on_kill_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    AppData *app = (AppData *)data;
+
+    if (app->selected_pid == 0) {
+        gtk_label_set_text(GTK_LABEL(app->status_label),
+                          "Error: No process selected");
+        return;
+    }
+
+    // Find the application root - this handles the case where user clicks
+    // on a child process (like Discord's "Web Content") but wants to kill
+    // the whole application
+    pid_t root_pid = find_application_root(app->selected_pid);
+
+    // Get the root process name for status message
+    char root_name[MAX_PROC_NAME] = "unknown";
+    char stat_path[64];
+    snprintf(stat_path, sizeof(stat_path), "/proc/%d/comm", root_pid);
+    FILE *f = fopen(stat_path, "r");
+    if (f) {
+        if (fgets(root_name, sizeof(root_name), f)) {
+            root_name[strcspn(root_name, "\n")] = '\0';
+        }
+        fclose(f);
+    }
+
+    // Kill from the application root down
+    int result = kill_process_tree(root_pid);
+
+    if (result > 0) {
+        char status[256];
+        if (root_pid != app->selected_pid) {
+            // We went up the tree - let user know
+            snprintf(status, sizeof(status),
+                     "Killed %s (PID %d) + %d child(ren) [root of selected process]",
+                     root_name, root_pid, result - 1);
+        } else {
+            snprintf(status, sizeof(status),
+                     "Killed %s (PID %d) + %d child(ren)",
+                     root_name, root_pid, result - 1);
+        }
+        gtk_label_set_text(GTK_LABEL(app->status_label), status);
+
+        // Clear selection since process is gone
+        app->selected_pid = 0;
+        app->selected_exe[0] = '\0';
+        app->selected_name[0] = '\0';
+
+        // Refresh the list to show updated state
+        update_process_list(app);
+    } else {
+        char status[256];
+        snprintf(status, sizeof(status), "Failed to kill %s (PID %d) - permission denied?",
+                 root_name, root_pid);
+        gtk_label_set_text(GTK_LABEL(app->status_label), status);
     }
 }
 
@@ -1036,6 +1234,11 @@ GtkWidget* create_main_window(AppData *app) {
     GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
     g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_clicked), app);
     gtk_box_pack_start(GTK_BOX(button_box), refresh_btn, TRUE, TRUE, 0);
+
+    GtkWidget *kill_btn = gtk_button_new_with_label("Kill");
+    gtk_widget_set_name(kill_btn, "kill-button");
+    g_signal_connect(kill_btn, "clicked", G_CALLBACK(on_kill_clicked), app);
+    gtk_box_pack_start(GTK_BOX(button_box), kill_btn, TRUE, TRUE, 0);
 
     gtk_box_pack_start(GTK_BOX(controls_box), button_box, FALSE, FALSE, 0);
 
