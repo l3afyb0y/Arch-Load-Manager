@@ -249,13 +249,31 @@ int get_process_cpu_usage(pid_t pid) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
 
-    unsigned long utime, stime;
-    if (fscanf(f, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
-               &utime, &stime) != 2) {
+    // Read the entire line - process names can contain spaces like "(Web Content)"
+    char line[512];
+    if (!fgets(line, sizeof(line), f)) {
         fclose(f);
         return 0;
     }
     fclose(f);
+
+    // Find the closing ')' - use strrchr to handle names with nested parens
+    char *p = strrchr(line, ')');
+    if (!p) return 0;
+    p += 2; // Skip ") "
+
+    // Parse fields after comm: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
+    // Fields:                   0    1    2    3       4   5     6     7      8       9      10      11    12
+    unsigned long utime, stime;
+    char state;
+    long ppid, pgrp, session, tty_nr, tpgid;
+    unsigned long flags, minflt, cminflt, majflt, cmajflt;
+    if (sscanf(p, "%c %ld %ld %ld %ld %ld %lu %lu %lu %lu %lu %lu %lu",
+               &state, &ppid, &pgrp, &session, &tty_nr, &tpgid,
+               &flags, &minflt, &cminflt, &majflt, &cmajflt,
+               &utime, &stime) != 13) {
+        return 0;
+    }
 
     unsigned long proc_cpu = utime + stime;
 

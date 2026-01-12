@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+arch-load-manager
+arch-load-daemon
+
+# Editor backups
+*~
+*.swp
+*.swo
