@@ -27,7 +27,7 @@ dist/
 bin/
 
 # Gemini CLI
-.gemini/*.local.md
+.gemini/
 .gemini_security/
 .ralph-state/
 
@@ -95,4 +95,3 @@ dkms.conf
 
 # debug information files
 *.dwo
-/.gemini/
