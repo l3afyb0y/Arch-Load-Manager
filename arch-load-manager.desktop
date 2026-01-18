@@ -1,8 +1,9 @@
+#!/usr/bin/env xdg-open
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Arch Load Manager
-Comment=Manage CPU affinity and process priorities
+Comment=Manage CPU affinity, process priorities, and interrupt service levels
 Exec=arch-load-manager
 Icon=arch-load-manager
 Terminal=false
