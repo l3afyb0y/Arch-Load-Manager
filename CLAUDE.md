@@ -56,18 +56,17 @@ Arch Linux is the expected operating system for this program.
 **common.h**: Defines core data structures used by both GUI and daemon
 - `Rule` struct: Holds CPU affinity (list of CPU IDs) and priority level
 - `Priority` enum: Maps to nice values (-20 to 19)
-- Config location: `~/.config/cpu_affinity_manager.json`
+- Config location: `$HOME/.config/cpu_affinity_manager.json` (daemon uses root's HOME by default)
 
 **config.c/config.h**: JSON configuration management using json-c and uthash
 - Two hash tables: `exe_rules` (keyed by full executable path) and `name_rules` (keyed by process name)
-- Hot-reload support via mtime checking
 - Rules can specify either/both: CPU affinity list, Priority level
 
 ### GUI (arch-load-manager.c)
 
 - GTK3 application with custom CSS ("Liquid Glass" theme)
-- Updates process list every 1 second
-- **Important**: Preserves scroll position and sort order during updates (lines 311-373)
+- Updates process list every 500ms (paused when minimized)
+- **Important**: In-place updates preserve scroll position and sort order during refresh
 - Stores only basename of executable in tree view (not full path)
 - Color-codes process names by CPU usage: green (<30%), yellow (30-70%), red (>70%)
 
@@ -103,10 +102,8 @@ This means:
 
 **Implementation**:
 - Global CPU snapshot taken once per update cycle to ensure consistency
-- Per-PID static arrays cache previous utime/stime values (up to 32768 PIDs)
-- First update initializes global snapshot
-- Second update initializes per-PID values
-- Third+ updates show actual CPU percentages
+- Per-PID hash map caches previous CPU time (no fixed PID cap)
+- First sample per PID returns 0; subsequent samples return delta-based percentages
 
 ### Display Format
 
@@ -116,12 +113,8 @@ This means:
 
 ### Scroll Position Preservation
 
-When updating the process list (every 1 second):
-1. Save vertical scroll position before clearing list
-2. Rebuild entire list from /proc scan
-3. Restore scroll position after rebuild
-
-This prevents the annoying "jump to top" behavior during updates.
+Process list updates are applied in-place using row references, which keeps the
+scroll position stable during refresh.
 
 ### Default Sort
 
@@ -166,9 +159,9 @@ The program was originally written by ChatGPT in Python, as a result, some of th
 - Remember: Negative nice values (High/Highest/Real-time) require root
 
 ### Everything Shows 0% CPU
-- First update uses full values (average since boot)
-- Subsequent updates use deltas - if still 0%, check the static cache initialization
-- Verify prev_total_cpu and prev_proc_cpu arrays are being updated
+- First sample per PID returns 0; subsequent samples use deltas
+- Check that `update_cpu_snapshot()` runs before per-PID reads
+- Verify `g_prev_total_cpu` and the CPU tracker map are updating
 
 ## Dependencies
 

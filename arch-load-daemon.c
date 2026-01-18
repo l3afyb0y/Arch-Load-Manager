@@ -14,15 +14,64 @@
 #include <syslog.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/syscall.h>
 
-#define MAX_EVENTS 10
+#define MAX_EVENTS 64
 #define EVENT_SIZE (sizeof(struct inotify_event))
 #define EVENT_BUF_LEN (MAX_EVENTS * (EVENT_SIZE + 16))
-#define OVERRIDE_FILE "/tmp/arch-load-manager-override"
 
 // Global config instance
 static Config *g_config = NULL;
+static char *g_config_path_override = NULL;
 static volatile sig_atomic_t g_running = 1;
+
+// ProBalance tracking
+typedef struct {
+    pid_t pid;
+    uint64_t start_time_ms;
+    bool suppressed;
+    int original_nice;
+    UT_hash_handle hh;
+} ProBalanceEntry;
+
+static ProBalanceEntry *g_pb_tracker = NULL;
+
+// Helper to get current time in ms
+static uint64_t get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Apply CPU affinity to IRQ
+bool apply_irq_affinity(int irq_id, const IrqRule *rule) {
+    if (!rule->has_affinity || rule->cpu_count == 0) return true;
+
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq_id);
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        syslog(LOG_WARNING, "Failed to open %s: %s", path, strerror(errno));
+        return false;
+    }
+
+    for (int i = 0; i < rule->cpu_count; i++) {
+        fprintf(f, "%d%s", rule->cpus[i], (i == rule->cpu_count - 1) ? "" : ",");
+    }
+
+    fclose(f);
+    syslog(LOG_INFO, "Applied affinity to IRQ %d: %s", irq_id, rule->device_name);
+    return true;
+}
+
+// Apply all configured IRQ rules
+void apply_all_irq_rules(void) {
+    IrqRuleEntry *entry, *tmp;
+    HASH_ITER(hh, g_config->irq_rules, entry, tmp) {
+        apply_irq_affinity(entry->irq_id, &entry->rule);
+    }
+}
 
 // Signal handler for graceful shutdown
 void signal_handler(int signum) {
@@ -36,7 +85,7 @@ bool get_process_exe(pid_t pid, char *exe_path, size_t size) {
     snprintf(proc_path, sizeof(proc_path), "/proc/%d/exe", pid);
 
     ssize_t len = readlink(proc_path, exe_path, size - 1);
-    if (len == -1) {
+    if (len <= 0 || (size_t)len >= size - 1) {
         return false;
     }
 
@@ -102,16 +151,55 @@ bool apply_priority(pid_t pid, const Rule *rule) {
         return false;
     }
 
-    syslog(LOG_INFO, "Applied priority to PID %d: %s (nice %d)",
+    // Apply scheduler policy if specified
+    if (rule->has_sched_policy) {
+        struct sched_param param = {0};
+        int policy = SCHED_OTHER;
+        switch (rule->sched_policy) {
+            case SCHED_POL_BATCH: policy = SCHED_BATCH; break;
+            case SCHED_POL_IDLE: policy = SCHED_IDLE; break;
+            case SCHED_POL_FIFO: policy = SCHED_FIFO; param.sched_priority = 1; break;
+            case SCHED_POL_RR: policy = SCHED_RR; param.sched_priority = 1; break;
+            default: policy = SCHED_OTHER; break;
+        }
+        if (sched_setscheduler(pid, policy, &param) == -1) {
+            syslog(LOG_WARNING, "Failed to set scheduler for PID %d: %s", pid, strerror(errno));
+        }
+    }
+
+    // Apply IO priority if specified
+    if (rule->has_ioprio) {
+        int p = IOPRIO_PRIO_VALUE(rule->ioprio_class, rule->ioprio_level);
+        if (ioprio_set(IOPRIO_WHO_PROCESS, pid, p) == -1) {
+            syslog(LOG_WARNING, "Failed to set IO priority for PID %d: %s", pid, strerror(errno));
+        }
+    }
+
+    syslog(LOG_INFO, "Applied priority/policy to PID %d: %s (nice %d)",
            pid, priority_name(rule->priority), nice_val);
     return true;
 }
 
+#include <sys/stat.h>
+#include <fcntl.h>
+
 // Check if PID is in the override file (test mode)
 bool is_pid_overridden(pid_t pid) {
-    FILE *f = fopen(OVERRIDE_FILE, "r");
+    int fd = open(OVERRIDE_FILE, O_RDONLY | O_NOFOLLOW);
+    if (fd == -1) {
+        return false;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) == -1 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return false;
+    }
+
+    FILE *f = fdopen(fd, "r");
     if (!f) {
-        return false;  // No override file means no overrides
+        close(fd);
+        return false;
     }
 
     char line[32];
@@ -124,6 +212,8 @@ bool is_pid_overridden(pid_t pid) {
             line[len - 1] = '\0';
         }
 
+        if (line[0] == '\0') continue;
+
         // Check if this line matches our PID
         pid_t override_pid = (pid_t)atoi(line);
         if (override_pid == pid) {
@@ -132,7 +222,7 @@ bool is_pid_overridden(pid_t pid) {
         }
     }
 
-    fclose(f);
+    fclose(f); // Also closes fd
     return found;
 }
 
@@ -199,14 +289,185 @@ void apply_rules_to_all_processes(void) {
     syslog(LOG_INFO, "Applied rules to all existing processes");
 }
 
+// Structure to track CPU deltas for ProBalance
+typedef struct {
+    pid_t pid;
+    unsigned long prev_proc_time;
+    UT_hash_handle hh;
+} CpuDelta;
+
+static CpuDelta *g_cpu_deltas = NULL;
+static unsigned long g_prev_total_time = 0;
+
+// Structure to hold process info from /proc/[pid]/stat
+typedef struct {
+    int ppid;
+    int pgid;
+    int tpgid;
+    unsigned long utime;
+    unsigned long stime;
+} ProcStat;
+
+static bool get_proc_stat(pid_t pid, ProcStat *ps) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+
+    // The comm field is in parens and can contain spaces/parens.
+    // We skip it by finding the last ')'.
+    char line[1024];
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+
+    char *p = strrchr(line, ')');
+    if (!p) return false;
+    
+    // After ')', fields are: state ppid pgid sid tty_nr tpgid ... utime stime
+    //                       0     1    2    3   4      5         11    12
+    if (sscanf(p + 2, "%*c %d %d %*d %*d %d %*u %*u %*u %*u %*u %lu %lu",
+               &ps->ppid, &ps->pgid, &ps->tpgid, &ps->utime, &ps->stime) != 5) {
+        return false;
+    }
+    return true;
+}
+
+// Calculate process CPU usage %
+static int get_cpu_usage_optimized(pid_t pid, unsigned long total_delta, unsigned long proc_time) {
+    if (total_delta == 0) return 0;
+
+    CpuDelta *d = NULL;
+    HASH_FIND_INT(g_cpu_deltas, &pid, d);
+    if (!d) {
+        d = calloc(1, sizeof(CpuDelta));
+        d->pid = pid;
+        d->prev_proc_time = proc_time;
+        HASH_ADD_INT(g_cpu_deltas, pid, d);
+        return 0;
+    }
+
+    unsigned long proc_delta = proc_time - d->prev_proc_time;
+    d->prev_proc_time = proc_time;
+
+    return (int)((proc_delta * 100) / total_delta);
+}
+
+// Check and handle ProBalance for all processes
+void handle_probalance(void) {
+    if (!g_config->probalance.enabled) return;
+
+    // Get total system time delta
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return;
+    unsigned long u, n, s, i, io, irq, sirq, steal;
+    if (fscanf(f, "cpu %lu %lu %lu %lu %lu %lu %lu %lu", &u, &n, &s, &i, &io, &irq, &sirq, &steal) != 8) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    unsigned long total_time = u + n + s + i + io + irq + sirq + steal;
+    unsigned long total_delta = total_time - g_prev_total_time;
+    g_prev_total_time = total_time;
+
+    if (total_delta == 0) return;
+
+    DIR *proc_dir = opendir("/proc");
+    if (!proc_dir) return;
+
+    uint64_t now = get_time_ms();
+    struct dirent *entry;
+    while ((entry = readdir(proc_dir)) != NULL) {
+        if (entry->d_type != DT_DIR) continue;
+        pid_t pid = (pid_t)atoi(entry->d_name);
+        if (pid <= 0) continue;
+
+        ProcStat ps;
+        if (!get_proc_stat(pid, &ps)) continue;
+
+        // Skip kernel threads
+        if (ps.ppid == 2) continue;
+
+        // Check foreground if enabled
+        if (g_config->probalance.ignore_foreground && ps.pgid == ps.tpgid && ps.tpgid != -1) {
+            continue;
+        }
+
+        int usage = get_cpu_usage_optimized(pid, total_delta, ps.utime + ps.stime);
+        bool above_threshold = usage >= g_config->probalance.cpu_threshold;
+
+        ProBalanceEntry *pb = NULL;
+        HASH_FIND_INT(g_pb_tracker, &pid, pb);
+
+        if (above_threshold) {
+            if (!pb) {
+                pb = calloc(1, sizeof(ProBalanceEntry));
+                pb->pid = pid;
+                pb->start_time_ms = now;
+                pb->original_nice = getpriority(PRIO_PROCESS, pid);
+                HASH_ADD_INT(g_pb_tracker, pid, pb);
+            } else if (!pb->suppressed && (now - pb->start_time_ms >= (uint64_t)g_config->probalance.duration_ms)) {
+                // Check if excluded by rule
+                const Rule *rule = NULL;
+                char exe[MAX_PATH_LEN], name[MAX_PROC_NAME];
+                if (get_process_exe(pid, exe, sizeof(exe))) rule = config_get_rule_by_exe(g_config, exe);
+                if (!rule && get_process_name(pid, name, sizeof(name))) rule = config_get_rule_by_name(g_config, name);
+                
+                if (rule && rule->exclude_probalance) {
+                    HASH_DEL(g_pb_tracker, pb);
+                    free(pb);
+                    continue;
+                }
+
+                // Suppress!
+                int new_nice = pb->original_nice + g_config->probalance.suppression_nice;
+                if (new_nice > 19) new_nice = 19;
+                if (setpriority(PRIO_PROCESS, pid, new_nice) == 0) {
+                    pb->suppressed = true;
+                    syslog(LOG_INFO, "ProBalance: Suppressed PID %d (%d%% CPU) to nice %d", pid, usage, new_nice);
+                }
+            }
+        } else if (pb) {
+            if (pb->suppressed) {
+                setpriority(PRIO_PROCESS, pid, pb->original_nice);
+                syslog(LOG_INFO, "ProBalance: Restored PID %d to original nice %d", pid, pb->original_nice);
+            }
+            HASH_DEL(g_pb_tracker, pb);
+            free(pb);
+        }
+    }
+    closedir(proc_dir);
+
+    // Cleanup dead processes from trackers
+    CpuDelta *cd, *cd_tmp;
+    HASH_ITER(hh, g_cpu_deltas, cd, cd_tmp) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d", cd->pid);
+        if (access(path, F_OK) != 0) {
+            HASH_DEL(g_cpu_deltas, cd);
+            free(cd);
+        }
+    }
+
+    ProBalanceEntry *pb_entry, *pb_tmp;
+    HASH_ITER(hh, g_pb_tracker, pb_entry, pb_tmp) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d", pb_entry->pid);
+        if (access(path, F_OK) != 0) {
+            HASH_DEL(g_pb_tracker, pb_entry);
+            free(pb_entry);
+        }
+    }
+}
+
 // Check if a string is a valid PID (all digits)
 bool is_pid_string(const char *str) {
     if (!str || *str == '\0') return false;
-
     for (const char *p = str; *p; p++) {
         if (*p < '0' || *p > '9') return false;
     }
-
     return true;
 }
 
@@ -229,7 +490,7 @@ void reload_config(void) {
 
     // Clear existing rules
     config_free(g_config);
-    g_config = config_init();
+    g_config = config_init(g_config_path_override);
 
     if (!g_config) {
         syslog(LOG_ERR, "Failed to reinitialize config");
@@ -243,11 +504,29 @@ void reload_config(void) {
 
     syslog(LOG_INFO, "Configuration reloaded");
 
-    // Reapply rules to all processes
+    // Reapply rules to all processes and IRQs
     apply_rules_to_all_processes();
+    apply_all_irq_rules();
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    // Parse arguments
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) && i + 1 < argc) {
+            g_config_path_override = argv[++i];
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("Arch Load Manager Daemon v%s\n", ARCH_LOAD_VERSION);
+            return 0;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: %s [options]\n", argv[0]);
+            printf("Options:\n");
+            printf("  -c, --config PATH  Path to configuration file\n");
+            printf("  -v, --version      Show version\n");
+            printf("  -h, --help         Show this help\n");
+            return 0;
+        }
+    }
+
     // Open syslog
     openlog("arch-load-daemon", LOG_PID | LOG_CONS, LOG_DAEMON);
     syslog(LOG_INFO, "Starting Arch Load Manager daemon v%s", ARCH_LOAD_VERSION);
@@ -257,7 +536,7 @@ int main(void) {
     signal(SIGINT, signal_handler);
 
     // Initialize config
-    g_config = config_init();
+    g_config = config_init(g_config_path_override);
     if (!g_config) {
         syslog(LOG_ERR, "Failed to initialize config");
         return 1;
@@ -270,8 +549,9 @@ int main(void) {
         syslog(LOG_INFO, "No configuration file found, starting with empty rules");
     }
 
-    // Apply rules to existing processes
+    // Apply rules to existing processes and IRQs
     apply_rules_to_all_processes();
+    apply_all_irq_rules();
 
     // Initialize inotify
     int inotify_fd = inotify_init1(IN_NONBLOCK);
@@ -328,11 +608,17 @@ int main(void) {
     // Event loop
     char event_buf[EVENT_BUF_LEN];
     struct epoll_event events[MAX_EVENTS];
+    uint64_t last_pb_time = 0;
 
     while (g_running) {
         // Wait for events (blocks with zero CPU usage)
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);  // 1 second timeout
+        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 500);
 
+        uint64_t now = get_time_ms();
+        if (now - last_pb_time >= 500) {
+            handle_probalance();
+            last_pb_time = now;
+        }
         if (n == -1) {
             if (errno == EINTR) continue;  // Interrupted by signal
             syslog(LOG_ERR, "epoll_wait failed: %s", strerror(errno));

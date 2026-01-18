@@ -34,7 +34,7 @@ This software was developed with AI assistance ("vibe-coded"). This means:
 - **No warranty**: Use at your own risk
 
 **Recommendations**:
-- Review the config file (`~/.config/cpu_affinity_manager.json`) before enabling the daemon
+- Review the config file (`~/.config/arch-load-manager.json`) before enabling the daemon
 - Monitor system behavior after applying new rules
 - Keep backups of working configurations
 - Report any issues you encounter
@@ -57,7 +57,7 @@ Arch Load Manager lets you:
 - **Automatic Rule Application**: Background daemon automatically applies saved rules
 - **Rule Persistence**: Rules saved by executable path or process name
 - **Test Mode**: Try settings without saving
-- **Apply to Children**: Propagate settings to child processes
+- **Apply to Process Family**: Apply settings to related processes with the same executable
 - **Ultra-Lightweight**: Daemon uses <0.05% CPU idle, ~2-5MB RAM
 - **Sortable Columns**: Sort by PID, Name, CPU%, or Memory%
 - **Color-Coded Processes**: Green (low), Yellow (medium), Red (high CPU usage)
@@ -65,7 +65,7 @@ Arch Load Manager lets you:
 ## Limitations
 
 - **Root required for negative nice values**: High, Highest, and Real-time priorities require the daemon to be running as root
-- **Single-user config**: The daemon reads config from the user who installed it; multi-user setups may need manual configuration
+- **Daemon config scope**: The systemd service runs as root by default and reads `/root/.config/arch-load-manager.json`. To use a user config, you can use the `--config` flag, run the daemon as that user, or set `Environment=HOME=/home/USER` in the service.
 - **Linux only**: Uses Linux-specific APIs (`/proc`, `sched_setaffinity`, `inotify`)
 - **Process matching**: Rules match exact executable paths or process names; no wildcard/regex support
 
@@ -89,7 +89,7 @@ Arch Load Manager lets you:
 
 ### Configuration
 
-Rules are stored in: `~/.config/cpu_affinity_manager.json`
+Rules are stored in: `~/.config/arch-load-manager.json`
 
 Format:
 ```json
@@ -113,33 +113,51 @@ Format:
 
 ## Installation
 
-### Quick Install (Arch Linux)
+### 🚀 Easy Installation (Any Distribution)
+
+The easiest way to install Arch Load Manager on any Linux distribution is using the provided installation script. This script will check for dependencies, build the project, and install all necessary files.
 
 ```bash
-# Install dependencies
-sudo pacman -S base-devel gtk3 json-c uthash
-
-# Clone repository
-git clone https://github.com/yourusername/arch-load-manager.git
-cd arch-load-manager
-
-# Run installation script
+git clone https://github.com/gitporker/Arch-Load-Manager.git
+cd Arch-Load-Manager
 chmod +x install.sh
 ./install.sh
 ```
 
-### Manual Build
+### 🏔️ Arch Linux (Official Installer)
+
+For Arch Linux and its derivatives (Manjaro, EndeavourOS, etc.), you can use the `PKGBUILD` to install it as a native package:
 
 ```bash
-# Build
-make all
+git clone https://github.com/gitporker/Arch-Load-Manager.git
+cd Arch-Load-Manager
+makepkg -si
+```
 
-# Install (requires root)
+### 🛠️ Manual Installation
+
+If you prefer to install manually:
+
+1. **Install dependencies:**
+   - GTK3 (e.g., `libgtk-3-dev` on Debian/Ubuntu, `gtk3` on Arch)
+   - JSON-C (e.g., `libjson-c-dev` on Debian/Ubuntu, `json-c` on Arch)
+   - UThash (e.g., `uthash-dev` on Debian/Ubuntu, `uthash` on Arch)
+   - Build tools: `gcc`, `make`, `pkg-config`
+
+2. **Build and Install:**
+```bash
+make
 sudo make install
+```
 
-# Enable daemon (optional)
+3. **Start the daemon:**
+```bash
 sudo systemctl enable --now arch-load-daemon
 ```
+
+## Maintainer
+
+**Porker Roland** - [gitporker@gmail.com](mailto:gitporker@gmail.com)
 
 ### Dependencies
 
@@ -190,10 +208,10 @@ Launch from:
 
 #### Options
 
-- **Test Mode**: Apply settings without saving to config
-- **Apply to children**: Also apply to child processes
+- **Test Mode**: Apply settings without saving; the daemon skips those PIDs while the GUI is open
+- **Apply to process family**: Also apply to related processes with the same executable
 
-### Daemon Service - MAKE SURE YOU ENABLE OR IT WILL NOT WORK PROERPLY
+### Daemon Service (enable or rules won't auto-apply)
 
 ```bash
 # Start daemon
@@ -202,18 +220,18 @@ sudo systemctl start arch-load-daemon
 # Enable on boot
 sudo systemctl enable arch-load-daemon
 
-# Check status
-sudo systemctl status arch-load-daemon
-
-# View logs
-sudo journalctl -u arch-load-daemon -f
+# Run manually with custom config
+arch-load-daemon --config /path/to/config.json
 ```
 
 ### Configuration File
 
-Edit `~/.config/cpu_affinity_manager.json` manually or use the GUI.
+Edit `~/.config/cpu_affinity_manager.json` manually or use the GUI. The systemd
+daemon runs as root by default and reads `/root/.config/cpu_affinity_manager.json`
+unless you override `HOME` in the service or run the daemon as your user.
 
-The daemon automatically reloads when the file changes.
+The daemon automatically reloads when the file changes. The `mode` field is
+currently always saved as `active` and ignored by the daemon.
 
 ## Priority Levels
 
@@ -242,7 +260,7 @@ The daemon automatically reloads when the file changes.
 Click column headers to sort by:
 - **PID**: Process ID
 - **Process Name**: Alphabetically
-- **CPU %**: Raw percentage (can exceed 100% on multi-core)
+- **CPU %**: Percentage of total CPU (all processes sum to ~100%)
 - **Memory %**: Percentage of total RAM
 
 Default: Sorted by CPU% (descending)
@@ -252,8 +270,8 @@ Default: Sorted by CPU% (descending)
 ### GUI (arch-load-manager)
 - Memory: ~20-30MB
 - Startup: <100ms
-- Update interval: 1 second
-- Zero overhead when minimized
+- Update interval: 500ms
+- Updates pause when minimized
 
 ### Daemon (arch-load-daemon)
 - CPU: <0.05% idle (event-driven)
@@ -274,6 +292,7 @@ ls -l /usr/local/bin/arch-load-daemon
 
 # Verify config
 cat ~/.config/cpu_affinity_manager.json | jq
+sudo cat /root/.config/cpu_affinity_manager.json | jq
 ```
 
 ### Permission Denied
@@ -344,13 +363,12 @@ make help
 arch-load-manager/
 ├── common.h               # Shared definitions
 ├── config.h               # Config management header
-├── config.c               # Config implementation (cJSON)
+├── config.c               # Config implementation (json-c)
 ├── arch-load-manager.c    # GTK3 GUI application
 ├── arch-load-daemon.c     # Background daemon
 ├── Makefile               # Build system
 ├── install.sh             # Installation script
 ├── uninstall.sh           # Removal script
-├── arch-load-manager.desktop  # Desktop entry
 └── README.md              # This file
 ```
 

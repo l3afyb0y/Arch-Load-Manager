@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Arch Load Manager - Uninstallation Script
-# This script removes all installed components of Arch Load Manager
+# Arch Load Manager - Uninstallation Script v2.1.0
+# Maintainer: Porker Roland <gitporker@gmail.com>
 
 set -e  # Exit on error
 
@@ -48,55 +48,14 @@ stop_daemon() {
     fi
 }
 
-# Remove systemd service
-remove_service() {
-    print_info "Removing systemd service..."
+# Remove installed files via Makefile
+remove_files() {
+    print_info "Removing installed files..."
 
-    local service_file="/etc/systemd/system/arch-load-daemon.service"
-
-    if [ -f "$service_file" ]; then
-        sudo rm "$service_file"
-        sudo systemctl daemon-reload
-        print_success "Service file removed"
+    if sudo make uninstall; then
+        print_success "Files removed"
     else
-        print_info "Service file not found"
-    fi
-}
-
-# Remove binaries
-remove_binaries() {
-    print_info "Removing installed binaries..."
-
-    local removed=0
-
-    if [ -f "/usr/local/bin/arch-load-manager" ]; then
-        sudo rm "/usr/local/bin/arch-load-manager"
-        print_success "Removed arch-load-manager"
-        removed=1
-    fi
-
-    if [ -f "/usr/local/bin/arch-load-daemon" ]; then
-        sudo rm "/usr/local/bin/arch-load-daemon"
-        print_success "Removed arch-load-daemon"
-        removed=1
-    fi
-
-    if [ $removed -eq 0 ]; then
-        print_info "No binaries found to remove"
-    fi
-}
-
-# Remove desktop entry
-remove_desktop_entry() {
-    print_info "Removing desktop entry..."
-
-    local desktop_file="/usr/share/applications/arch-load-manager.desktop"
-
-    if [ -f "$desktop_file" ]; then
-        sudo rm "$desktop_file"
-        print_success "Desktop entry removed"
-    else
-        print_info "Desktop entry not found"
+        print_warning "Make uninstall failed, manual cleanup may be needed"
     fi
 }
 
@@ -107,7 +66,7 @@ remove_config() {
     echo ""
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        local config_file="$HOME/.config/cpu_affinity_manager.json"
+        local config_file="$HOME/.config/arch-load-manager.json"
 
         if [ -f "$config_file" ]; then
             rm "$config_file"
@@ -116,7 +75,7 @@ remove_config() {
             print_info "No configuration file found"
         fi
     else
-        print_info "Configuration file preserved at: ~/.config/cpu_affinity_manager.json"
+        print_info "Configuration file preserved at: ~/.config/arch-load-manager.json"
     fi
 }
 
@@ -139,11 +98,9 @@ main() {
 
     # Stop and remove daemon
     stop_daemon
-    remove_service
 
     # Remove installed files
-    remove_binaries
-    remove_desktop_entry
+    remove_files
 
     # Ask about config
     remove_config

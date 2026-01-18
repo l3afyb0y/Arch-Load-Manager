@@ -1,0 +1,19 @@
+[Unit]
+Description=Arch Load Manager - Process Affinity Daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arch-load-daemon
+Restart=on-failure
+RestartSec=5s
+User=root
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/proc /tmp /etc
+
+[Install]
+WantedBy=multi-user.target

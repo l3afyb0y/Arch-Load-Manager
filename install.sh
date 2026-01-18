@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Arch Load Manager - Installation Script
-# This script installs the Arch Load Manager application and daemon
+# Arch Load Manager - Installation Script v2.1.0
+# Maintainer: Porker Roland <gitporker@gmail.com>
 
 set -e  # Exit on error
 
@@ -96,16 +96,16 @@ check_dependencies() {
         local pm=$(detect_package_manager)
         case $pm in
             pacman)
-                echo "  sudo pacman -S base-devel gtk3 json-c uthash libdbusmenu-gtk3"
+                echo "  sudo pacman -S base-devel gtk3 json-c uthash"
                 ;;
             apt)
-                echo "  sudo apt install build-essential libgtk-3-dev libjson-c-dev uthash-dev appmenu-gtk3-module"
+                echo "  sudo apt install build-essential libgtk-3-dev libjson-c-dev uthash-dev"
                 ;;
             dnf|yum)
-                echo "  sudo $pm install gcc make pkg-config gtk3-devel json-c-devel uthash-devel appmenu-gtk3-module"
+                echo "  sudo $pm install gcc make pkg-config gtk3-devel json-c-devel uthash-devel"
                 ;;
             *)
-                echo "  Install: gcc, make, pkg-config, gtk3, json-c, uthash, appmenu-gtk-module"
+                echo "  Install: gcc, make, pkg-config, gtk3, json-c, uthash"
                 ;;
         esac
         return 1
@@ -132,19 +132,20 @@ build_project() {
     fi
 }
 
-# Install binaries
-install_binaries() {
-    print_info "Installing binaries..."
-
-    sudo install -Dm755 arch-load-manager /usr/local/bin/arch-load-manager
-    sudo install -Dm755 arch-load-daemon /usr/local/bin/arch-load-daemon
-
-    print_success "Binaries installed to /usr/local/bin/"
+# Install binaries and files via Makefile
+install_files() {
+    print_info "Installing files..."
+    if sudo make install; then
+        print_success "Files installed successfully"
+    else
+        print_error "Installation failed"
+        return 1
+    fi
 }
 
-# Install icon to hicolor theme (works on KDE, GNOME, XFCE, etc.)
+# Install icons (extra step for resizing)
 install_icons() {
-    print_info "Installing application icons..."
+    print_info "Installing application icons (resized)..."
 
     if [ ! -f "Arch Load Manager.png" ]; then
         print_warning "Icon file 'Arch Load Manager.png' not found, skipping..."
@@ -159,110 +160,34 @@ install_icons() {
         local dest_dir="${icon_base}/${size}x${size}/apps"
         sudo mkdir -p "$dest_dir"
 
-        # Use ImageMagick if available, otherwise just copy the original
+        # Use ImageMagick if available
         if command -v magick &> /dev/null; then
             sudo magick "Arch Load Manager.png" -resize "${size}x${size}" \
                 "$dest_dir/arch-load-manager.png"
         elif command -v convert &> /dev/null; then
             sudo convert "Arch Load Manager.png" -resize "${size}x${size}" \
                 "$dest_dir/arch-load-manager.png" 2>/dev/null
-        else
-            # Fallback: copy original (GTK will scale it)
-            sudo install -Dm644 "Arch Load Manager.png" "$dest_dir/arch-load-manager.png"
         fi
     done
-
-    # Also install to pixmaps as fallback for legacy apps
-    sudo install -Dm644 "Arch Load Manager.png" /usr/share/pixmaps/arch-load-manager.png
 
     # Update icon cache
     if command -v gtk-update-icon-cache &> /dev/null; then
         sudo gtk-update-icon-cache -f -t "$icon_base" 2>/dev/null || true
     fi
 
-    print_success "Icons installed to hicolor theme"
+    print_success "Icons installed and cache updated"
 }
 
-# Create systemd service
-install_daemon_service() {
-    print_info "Creating systemd service..."
-
-    local service_file="/etc/systemd/system/arch-load-daemon.service"
-
-    sudo tee "$service_file" > /dev/null << 'EOF'
-[Unit]
-Description=Arch Load Manager - Process Affinity Daemon
-Documentation=https://github.com/yourusername/arch-load-manager
-After=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/arch-load-daemon
-Restart=on-failure
-RestartSec=5s
-
-# Run as root to manage process priorities/affinities
-User=root
-
-# Security settings
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/proc /tmp
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo systemctl daemon-reload
-    print_success "Systemd service created"
-}
-
-# Install desktop entry
-install_desktop_entry() {
-    print_info "Installing desktop entry..."
-
-    local desktop_file="/usr/share/applications/arch-load-manager.desktop"
-
-    sudo tee "$desktop_file" > /dev/null << 'EOF'
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Arch Load Manager
-Comment=Manage CPU affinity and process priorities
-Exec=arch-load-manager
-Icon=arch-load-manager
-Terminal=false
-Categories=System;Monitor;
-Keywords=cpu;affinity;priority;process;performance;
-StartupNotify=true
-StartupWMClass=arch-load-manager
-EOF
-
-    sudo chmod 644 "$desktop_file"
-    print_success "Desktop entry installed"
-}
-
-# Ask user if they want to enable the daemon
+# Setup and start the daemon
 setup_daemon() {
-    echo ""
-    read -p "Do you want to enable and start the daemon service? (y/n) " -n 1 -r
-    echo ""
-
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Enabling and starting daemon..."
-        sudo systemctl enable arch-load-daemon
-        sudo systemctl start arch-load-daemon
-
-        if sudo systemctl is-active --quiet arch-load-daemon; then
-            print_success "Daemon is running"
-        else
-            print_warning "Daemon failed to start. Check: sudo journalctl -u arch-load-daemon"
-        fi
+    print_info "Setting up daemon service..."
+    
+    if command -v systemctl &> /dev/null; then
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now arch-load-daemon
+        print_success "Daemon service enabled and started"
     else
-        print_info "Daemon not started. You can enable it later with:"
-        echo "  sudo systemctl enable --now arch-load-daemon"
+        print_warning "systemctl not found. Please start the daemon manually."
     fi
 }
 
@@ -273,6 +198,8 @@ main() {
     echo "  Arch Load Manager - Installation"
     echo "======================================"
     echo ""
+
+    check_root || true
 
     # Check dependencies
     if ! check_dependencies; then
@@ -285,10 +212,8 @@ main() {
     fi
 
     # Install
-    install_binaries
+    install_files
     install_icons
-    install_daemon_service
-    install_desktop_entry
 
     # Setup daemon
     setup_daemon
@@ -304,7 +229,7 @@ main() {
     echo "  sudo systemctl status arch-load-daemon"
     echo ""
     echo "Configuration file location:"
-    echo "  ~/.config/cpu_affinity_manager.json"
+    echo "  ~/.config/arch-load-manager.json"
     echo ""
 }
 

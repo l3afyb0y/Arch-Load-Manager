@@ -1,9 +1,24 @@
-# Build artifacts
-*.o
+# Binaries
 arch-load-manager
 arch-load-daemon
 
-# Editor backups
+# Objects
+*.o
+
+# Temporary files
+/tmp/
+.directory
 *~
 *.swp
-*.swo
+
+# Override file (test mode)
+arch-load-manager-override
+
+# Config (local testing)
+cpu_affinity_manager.json
+arch-load-manager.json
+
+# Build directories
+build/
+dist/
+bin/

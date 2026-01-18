@@ -21,6 +21,12 @@ COMMON_HEADERS = common.h config.h
 GUI_OBJECTS = $(GUI_SOURCES:.c=.o)
 DAEMON_OBJECTS = $(DAEMON_SOURCES:.c=.o)
 
+# Installation paths
+PREFIX ?= /usr/local
+BINDIR = $(PREFIX)/bin
+DATADIR = $(PREFIX)/share
+SYSCONFDIR = /etc
+
 # Default target
 all: $(GUI_TARGET) $(DAEMON_TARGET)
 
@@ -53,24 +59,29 @@ daemon: $(DAEMON_TARGET)
 clean:
 	rm -f $(GUI_TARGET) $(DAEMON_TARGET) *.o
 
-# Install (requires root for daemon and desktop file)
+# Install (standard Linux paths)
 install: all
-	@echo "Installing Arch Load Manager..."
-	install -Dm755 $(GUI_TARGET) $(DESTDIR)/usr/local/bin/$(GUI_TARGET)
-	install -Dm755 $(DAEMON_TARGET) $(DESTDIR)/usr/local/bin/$(DAEMON_TARGET)
-	install -Dm644 arch-load-manager.desktop $(DESTDIR)/usr/share/applications/arch-load-manager.desktop
+	@echo "Installing Arch Load Manager to $(PREFIX)..."
+	install -Dm755 $(GUI_TARGET) $(DESTDIR)$(BINDIR)/$(GUI_TARGET)
+	install -Dm755 $(DAEMON_TARGET) $(DESTDIR)$(BINDIR)/$(DAEMON_TARGET)
+	install -Dm644 arch-load-manager.desktop $(DESTDIR)$(DATADIR)/applications/arch-load-manager.desktop
+	# Patch service file with correct path and install
+	sed "s|ExecStart=.*|ExecStart=$(BINDIR)/$(DAEMON_TARGET)|" arch-load-daemon.service > arch-load-daemon.service.tmp
+	install -Dm644 arch-load-daemon.service.tmp $(DESTDIR)$(SYSCONFDIR)/systemd/system/arch-load-daemon.service
+	rm arch-load-daemon.service.tmp
+	# Install icon
+	install -Dm644 "Arch Load Manager.png" $(DESTDIR)$(DATADIR)/pixmaps/arch-load-manager.png
 	@echo "Installation complete!"
-	@echo "To enable the daemon: sudo systemctl enable --now arch-load-daemon"
+	@echo "To enable and start the daemon: sudo systemctl enable --now arch-load-daemon"
 
 # Uninstall
 uninstall:
-	@echo "Uninstalling Arch Load Manager..."
-	rm -f /usr/local/bin/$(GUI_TARGET)
-	rm -f /usr/local/bin/$(DAEMON_TARGET)
-	rm -f /usr/share/applications/arch-load-manager.desktop
-	systemctl disable arch-load-daemon 2>/dev/null || true
-	systemctl stop arch-load-daemon 2>/dev/null || true
-	rm -f /etc/systemd/system/arch-load-daemon.service
+	@echo "Uninstalling Arch Load Manager from $(PREFIX)..."
+	rm -f $(DESTDIR)$(BINDIR)/$(GUI_TARGET)
+	rm -f $(DESTDIR)$(BINDIR)/$(DAEMON_TARGET)
+	rm -f $(DESTDIR)$(DATADIR)/applications/arch-load-manager.desktop
+	rm -f $(DESTDIR)$(SYSCONFDIR)/systemd/system/arch-load-daemon.service
+	rm -f $(DESTDIR)$(DATADIR)/pixmaps/arch-load-manager.png
 	@echo "Uninstall complete!"
 
 # Help

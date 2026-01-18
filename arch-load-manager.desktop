@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Arch Load Manager
+Comment=Manage CPU affinity and process priorities
+Exec=arch-load-manager
+Icon=arch-load-manager
+Terminal=false
+Categories=System;Monitor;
+Keywords=cpu;affinity;priority;process;performance;
+StartupNotify=true
+StartupWMClass=arch-load-manager
